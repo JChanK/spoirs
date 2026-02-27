@@ -209,7 +209,7 @@ def dispatch(conn, line, client_id):
 
 # ─── Обработка клиента ────────────────────────────────────────────────────────
 def handle_client(conn, addr):
-    client_id = f"{addr[0]}:{addr[1]}"
+    client_id = addr[0]  # только IP, без порта — иначе докачка не найдёт сессию при переподключении
     print(f"[SERVER] Подключён {client_id}")
     configure_keepalive(conn)
     send_line(conn, "Привет! Команды: ECHO <текст> | TIME | UPLOAD <файл> | DOWNLOAD <файл> | CLOSE")
