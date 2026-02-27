@@ -1,0 +1,27 @@
+# В корневой папке spoirs/
+
+# Общие для всех лабораторных
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+
+# Виртуальные окружения
+**/venv/
+**/.venv/
+**/env/
+
+# PyCharm для всех проектов
+.idea/
+**/.idea/
+
+# OS files
+**/.DS_Store
+**/Thumbs.db
+
+# Специфичное для лабораторных работ
+**/server_files/
+**/sessions/
+**/downloads/
+**/*.bin
+**/*.log
+**/*.session
