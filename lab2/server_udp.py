@@ -1,32 +1,34 @@
-"""
-Лабораторная работа №2 — UDP Сервер
-Поддерживает команды: ECHO, TIME, CLOSE, UPLOAD, DOWNLOAD
-Реализует скользящее окно, ACK, повторную передачу, докачку файлов
-"""
-
+# В начале файла добавим:
+import threading
+import time
 import socket
 import os
 import datetime
 import hashlib
-import time
-import struct
-
+from collections import deque
 from udp_protocol import (
-    HEADER_SIZE, BUFFER_SIZE, DEFAULT_PORT,
-    PACKET_TYPE_CMD, PACKET_TYPE_CMDACK, PACKET_TYPE_DATA, PACKET_TYPE_FIN,
+    HEADER_SIZE, DEFAULT_PORT,
+    PACKET_TYPE_CMD, PACKET_TYPE_CMDACK, PACKET_TYPE_DATA,
     pack_header, unpack_header,
     SlidingWindowSender, SlidingWindowReceiver,
 )
 
-# ─── Константы ────────────────────────────────────────────────────────────────
-HOST        = "0.0.0.0"
-PORT        = DEFAULT_PORT
-FILES_DIR   = "server_files_udp"
+HOST         = "0.0.0.0"
+PORT         = DEFAULT_PORT
+FILES_DIR    = "server_files_udp"
 SESSIONS_DIR = "sessions_udp"
-CMD_TIMEOUT = 100.0   # сек ожидания командного пакета
+CMD_BUFSIZE  = HEADER_SIZE + 4096
+CLIENT_TIMEOUT = 30  # Таймаут неактивности клиента в секундах
+
+_sock: socket.socket = None   # главный CMD-сокет
+_send_lock = threading.Lock()
+
+# ИЗМЕНЕНИЕ: Ключ - только IP-адрес, а не полный адрес
+# client_ip -> {"cmd_ports": set(), "sessions": dict, "last_activity": float}
+_clients      = {}
+_clients_lock = threading.Lock()
 
 
-# ─── Инициализация ────────────────────────────────────────────────────────────
 def ensure_directories():
     os.makedirs(FILES_DIR, exist_ok=True)
     os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -35,122 +37,236 @@ def ensure_directories():
 def create_server_socket():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16*1024*1024)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16*1024*1024)
-
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024 * 1024)
     s.bind((HOST, PORT))
     print(f"[UDP-SERVER] Слушаю на {HOST}:{PORT}")
     return s
 
 
-# ─── Командный обмен ──────────────────────────────────────────────────────────
-def recv_cmd(sock, addr, timeout=CMD_TIMEOUT):
-    """Принять командный пакет от addr, вернуть строку или None."""
-    sock.settimeout(timeout)
-    while True:
+def make_data_socket():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024 * 1024)
+    s.settimeout(1.0)
+    s.bind(('', 0))
+    return s
+
+
+def _send_cmd_pkt(addr, pkt):
+    with _send_lock:
+        _sock.sendto(pkt, addr)
+
+
+# ─── Диспетчер ───────────────────────────────────────────────────────────────
+
+def dispatcher(stop_evt):
+    """Единственный поток читающий главный сокет."""
+    last_cleanup = time.monotonic()
+
+    while not stop_evt.is_set():
+        _sock.settimeout(0.1)
         try:
-            raw, src = sock.recvfrom(HEADER_SIZE + 512)
+            raw, addr = _sock.recvfrom(CMD_BUFSIZE)
+
+            # Обновляем время активности для этого клиента (по IP)
+            client_ip = addr[0]
+            with _clients_lock:
+                if client_ip in _clients:
+                    _clients[client_ip]["last_activity"] = time.monotonic()
+                    # Добавляем порт в множество активных портов клиента
+                    _clients[client_ip]["cmd_ports"].add(addr[1])
+
         except socket.timeout:
-            return None
-        if src != addr:
+            now = time.monotonic()
+            if now - last_cleanup > 5:
+                cleanup_inactive_clients(now)
+                last_cleanup = now
             continue
-        ptype, _flags, _win, seq, length, payload = unpack_header(raw)
-        if ptype != PACKET_TYPE_CMD:
-            continue
-        ack = pack_header(PACKET_TYPE_CMDACK, seq, 0)
-        sock.sendto(ack, addr)
-        return payload[:length].decode(errors="replace")
+        except OSError:
+            break
 
-
-def send_cmd(sock, addr, text):
-    """Отправить командный пакет и дождаться CMDACK."""
-    payload = text.encode()
-    header  = pack_header(PACKET_TYPE_CMD, 0, len(payload))
-    packet  = header + payload
-
-    for _ in range(10):
-        sock.sendto(packet, addr)
-        sock.settimeout(0.5)
         try:
-            raw, src = sock.recvfrom(HEADER_SIZE + 4)
-            if src == addr:
-                ptype, *_ = unpack_header(raw)
-                if ptype == PACKET_TYPE_CMDACK:
-                    return True
-        except socket.timeout:
-            pass
-    return False
+            ptype, _f, _w, seq, length, payload = unpack_header(raw)
+        except ValueError:
+            continue
+
+        if ptype == PACKET_TYPE_CMD:
+            # Подтвердить получение
+            _send_cmd_pkt(addr, pack_header(PACKET_TYPE_CMDACK, seq, 0))
+            line = payload[:length].decode(errors="replace")
+
+            client_ip = addr[0]
+            with _clients_lock:
+                entry = _clients.get(client_ip)
+
+            if entry is not None:
+                # Добавляем команду во все потоки клиента
+                # Вместо одного потока на порт, у нас один поток на IP
+                pass
+            else:
+                # Новый клиент по IP
+                new_entry = {
+                    "cmd_ports": {addr[1]},
+                    "sessions": {},
+                    "last_activity": time.monotonic(),
+                    "thread": None,
+                    "cmd_queue": deque()
+                }
+                with _clients_lock:
+                    _clients[client_ip] = new_entry
+
+                # Запускаем один поток для всего IP
+                thread = threading.Thread(
+                    target=client_session,
+                    args=(client_ip,),
+                    daemon=True,
+                )
+                thread.start()
+                new_entry["thread"] = thread
+
+            # Добавляем команду в очередь для этого IP
+            with _clients_lock:
+                if client_ip in _clients:
+                    _clients[client_ip]["cmd_queue"].append(line)
+
+        elif ptype == PACKET_TYPE_CMDACK:
+            client_ip = addr[0]
+            with _clients_lock:
+                entry = _clients.get(client_ip)
+            if entry:
+                # Можно использовать для синхронизации, но сейчас не критично
+                pass
 
 
-# ─── Сессии докачки ───────────────────────────────────────────────────────────
-def session_path(client_id, key):
-    h = hashlib.md5(f"{client_id}:{key}".encode()).hexdigest()
+def cleanup_inactive_clients(now):
+    """Удалить неактивных клиентов"""
+    with _clients_lock:
+        inactive = [ip for ip, data in _clients.items()
+                   if now - data.get("last_activity", 0) > CLIENT_TIMEOUT]
+        for ip in inactive:
+            print(f"[UDP-SERVER] Клиент {ip} неактивен, удаляем")
+            _clients.pop(ip, None)
+
+
+# ─── CMD обмен ───────────────────────────────────────────────────────────────
+
+def send_cmd_to_ip(client_ip, text, retries=10):
+    """Отправить команду всем портам клиента"""
+    with _clients_lock:
+        entry = _clients.get(client_ip)
+    if not entry:
+        return False
+
+    ports = entry["cmd_ports"]
+    if not ports:
+        return False
+
+    pl = text.encode()
+    pkt = pack_header(PACKET_TYPE_CMD, 0, len(pl)) + pl
+
+    # Отправляем на все порты клиента (на всякий случай)
+    for port in ports:
+        addr = (client_ip, port)
+        for _ in range(retries):
+            _send_cmd_pkt(addr, pkt)
+            # Ждем ACK (упрощенно)
+            time.sleep(0.1)
+
+    return True
+
+
+def recv_cmd_for_ip(client_ip, timeout=120.0):
+    """Получить команду из очереди для IP"""
+    with _clients_lock:
+        entry = _clients.get(client_ip)
+    if not entry:
+        return None
+
+    q = entry["cmd_queue"]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if q:
+            return q.popleft()
+        time.sleep(0.005)
+    return None
+
+
+# ─── Сессии (докачка) ────────────────────────────────────────────────────────
+
+def _sf(cid, key):
+    h = hashlib.md5(f"{cid}:{key}".encode()).hexdigest()
     return os.path.join(SESSIONS_DIR, h + ".session")
 
+def load_session(cid, key):
+    p = _sf(cid, key)
+    return int(open(p).read().strip()) if os.path.exists(p) else 0
 
-def load_session(client_id, key):
-    p = session_path(client_id, key)
-    if os.path.exists(p):
-        with open(p) as f:
-            return int(f.read().strip())
-    return 0
+def save_session(cid, key, v):
+    open(_sf(cid, key), "w").write(str(v))
 
-
-def save_session(client_id, key, offset):
-    with open(session_path(client_id, key), "w") as f:
-        f.write(str(offset))
+def delete_session(cid, key):
+    p = _sf(cid, key)
+    if os.path.exists(p): os.remove(p)
 
 
-def delete_session(client_id, key):
-    p = session_path(client_id, key)
-    if os.path.exists(p):
-        os.remove(p)
+# ─── Обработчики команд ──────────────────────────────────────────────────────
+
+def handle_echo(client_ip, args):
+    send_cmd_to_ip(client_ip, args if args else "(пусто)")
 
 
-# ─── Обработчики команд ───────────────────────────────────────────────────────
-def handle_echo(sock, addr, args):
-    send_cmd(sock, addr, args if args else "(пусто)")
+def handle_time(client_ip):
+    send_cmd_to_ip(client_ip, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
-def handle_time(sock, addr, _args):
-    send_cmd(sock, addr, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+def handle_upload(client_ip, filename, client_id):
+    if not filename:
+        send_cmd_to_ip(client_ip, "ERROR: укажите имя файла"); return
 
-
-def handle_upload(sock, addr, args, client_id):
-    if not args:
-        send_cmd(sock, addr, "ERROR: укажите имя файла")
-        return
-
-    filename = os.path.basename(args)
+    filename = os.path.basename(filename)
     filepath = os.path.join(FILES_DIR, filename)
     offset   = load_session(client_id, "upload:" + filename)
 
-    # Получить размер файла
-    size_str = recv_cmd(sock, addr)
+    send_cmd_to_ip(client_ip, f"READY {filename}")
+
+    size_str = recv_cmd_for_ip(client_ip, timeout=30)
     if not size_str or not size_str.startswith("SIZE"):
-        send_cmd(sock, addr, "ERROR: ожидался SIZE")
-        return
+        send_cmd_to_ip(client_ip, f"ERROR: ожидался SIZE, получил {size_str!r}"); return
     total_size = int(size_str.split()[1])
 
-    send_cmd(sock, addr, f"OFFSET {offset}")
+    data_sock = make_data_socket()
+    data_port = data_sock.getsockname()[1]
+    send_cmd_to_ip(client_ip, f"OFFSET {offset} DATAPORT {data_port}")
 
     remaining = total_size - offset
     if remaining <= 0:
         delete_session(client_id, "upload:" + filename)
-        send_cmd(sock, addr, "OK уже загружен")
-        return
+        data_sock.close()
+        send_cmd_to_ip(client_ip, "OK уже загружен полностью"); return
 
-    receiver = SlidingWindowReceiver(sock, addr, remaining, PACKET_TYPE_DATA)
-    start    = time.monotonic()
+    print(f"[UDP-SERVER] Ожидаю DATA на порту {data_port} от {client_ip}, осталось {remaining} байт")
 
+    receiver = SlidingWindowReceiver(data_sock, (client_ip, 0), remaining, PACKET_TYPE_DATA)
+
+    start = time.monotonic()
     try:
         data = receiver.receive()
-    except ConnectionError as e:
+    except (ConnectionError, TimeoutError) as e:
         save_session(client_id, "upload:" + filename, offset)
+        data_sock.close()
         print(f"[UDP-SERVER] Обрыв UPLOAD {filename}: {e}")
+        try:
+            send_cmd_to_ip(client_ip, f"ERROR: передача прервана")
+        except:
+            pass
+        return
+    except Exception as e:
+        print(f"[UDP-SERVER] Ошибка UPLOAD {filename}: {e}")
+        data_sock.close()
         return
 
+    data_sock.close()
     mode = "ab" if offset > 0 else "wb"
     with open(filepath, mode) as f:
         f.write(data)
@@ -158,124 +274,133 @@ def handle_upload(sock, addr, args, client_id):
     elapsed = time.monotonic() - start or 0.001
     bitrate = remaining / elapsed / 1024
     delete_session(client_id, "upload:" + filename)
-    send_cmd(sock, addr, f"OK размер={total_size} скорость={bitrate:.1f} КБ/с")
+    send_cmd_to_ip(client_ip, f"OK размер={total_size} скорость={bitrate:.1f} КБ/с")
     print(f"[UDP-SERVER] UPLOAD {filename} завершён, {bitrate:.1f} КБ/с")
 
 
-def handle_download(sock, addr, args, client_id):
-    if not args:
-        send_cmd(sock, addr, "ERROR: укажите имя файла")
-        return
+def handle_download(client_ip, filename, client_id):
+    if not filename:
+        send_cmd_to_ip(client_ip, "ERROR: укажите имя файла"); return
 
-    filename = os.path.basename(args)
+    filename = os.path.basename(filename)
     filepath = os.path.join(FILES_DIR, filename)
-
     if not os.path.exists(filepath):
-        send_cmd(sock, addr, "ERROR: файл не найден")
-        return
+        send_cmd_to_ip(client_ip, "ERROR: файл не найден"); return
 
     total_size = os.path.getsize(filepath)
 
-    offset_str = recv_cmd(sock, addr)
+    offset_str = recv_cmd_for_ip(client_ip)
     try:
         offset = int(offset_str.split()[1]) if offset_str else 0
     except (IndexError, ValueError):
         offset = 0
 
-    send_cmd(sock, addr, f"SIZE {total_size}")
+    data_sock = make_data_socket()
+    data_port = data_sock.getsockname()[1]
+    send_cmd_to_ip(client_ip, f"SIZE {total_size} DATAPORT {data_port}")
 
     with open(filepath, "rb") as f:
-        f.seek(offset)
-        data = f.read()
+        f.seek(offset); data = f.read()
 
-    sender = SlidingWindowSender(sock, addr)
+    # Для отправки данных нужен полный адрес клиента
+    # Берем первый порт из множества
+    with _clients_lock:
+        ports = _clients.get(client_ip, {}).get("cmd_ports", set())
+    if ports:
+        client_addr = (client_ip, next(iter(ports)))
+    else:
+        client_addr = (client_ip, 0)
+
+    sender = SlidingWindowSender(data_sock, client_addr)
     start  = time.monotonic()
-
     try:
-        sent, elapsed = sender.send(data, PACKET_TYPE_DATA)
-    except Exception as e:
+        _sent, elapsed = sender.send(data, PACKET_TYPE_DATA)
+    except ConnectionError as e:
         save_session(client_id, "download:" + filename, offset)
+        data_sock.close()
         print(f"[UDP-SERVER] Обрыв DOWNLOAD {filename}: {e}")
         return
 
-    bitrate = (total_size - offset) / elapsed / 1024
+    data_sock.close()
+    bitrate = len(data) / elapsed / 1024
     delete_session(client_id, "download:" + filename)
     print(f"[UDP-SERVER] DOWNLOAD {filename} завершён, {bitrate:.1f} КБ/с")
 
 
-# ─── Диспетчер команд ─────────────────────────────────────────────────────────
-def dispatch(sock, line, addr, client_id):
+# ─── Диспетчер команд ────────────────────────────────────────────────────────
+
+def dispatch(line, client_ip, client_id):
     parts = line.strip().split(None, 1)
-    if not parts:
-        return True
+    if not parts: return True
     cmd  = parts[0].upper()
     args = parts[1] if len(parts) > 1 else ""
 
-    if cmd == "ECHO":
-        handle_echo(sock, addr, args)
+    if cmd == "HELLO":
+        pass
+    elif cmd == "ECHO":
+        handle_echo(client_ip, args)
     elif cmd == "TIME":
-        handle_time(sock, addr, args)
+        handle_time(client_ip)
     elif cmd in ("CLOSE", "EXIT", "QUIT"):
-        send_cmd(sock, addr, "BYE")
-        return False
+        send_cmd_to_ip(client_ip, "BYE"); return False
     elif cmd == "UPLOAD":
-        handle_upload(sock, addr, args, client_id)
+        handle_upload(client_ip, args, client_id)
     elif cmd == "DOWNLOAD":
-        handle_download(sock, addr, args, client_id)
+        handle_download(client_ip, args, client_id)
     else:
-        send_cmd(sock, addr, f"ERROR: неизвестная команда '{cmd}'")
-
+        send_cmd_to_ip(client_ip, f"ERROR: неизвестная команда '{cmd}'")
     return True
 
 
-# ─── Обработка одного клиента ─────────────────────────────────────────────────
-def handle_client(sock, addr, first_cmd):
-    client_id = f"{addr[0]}:{addr[1]}"
-    print(f"[UDP-SERVER] Новый клиент {client_id}")
-    send_cmd(sock, addr, "Привет! Команды: ECHO TIME UPLOAD DOWNLOAD CLOSE")
+# ─── Сессия клиента ──────────────────────────────────────────────────────────
 
-    line = first_cmd
-    while line is not None:
-        print(f"[UDP-SERVER] {client_id} -> {line!r}")
-        if not dispatch(sock, line, addr, client_id):
+def client_session(client_ip):
+    client_id = client_ip  # Используем IP как ID
+    print(f"[UDP-SERVER] Новый клиент {client_ip}")
+    send_cmd_to_ip(client_ip, "Привет! Команды: ECHO TIME UPLOAD DOWNLOAD CLOSE")
+
+    while True:
+        line = recv_cmd_for_ip(client_ip, timeout=CLIENT_TIMEOUT)
+        if line is None:
+            # Таймаут - проверяем, активен ли еще клиент
+            with _clients_lock:
+                if client_ip not in _clients:
+                    break
+                last_act = _clients[client_ip].get("last_activity", 0)
+                if time.monotonic() - last_act > CLIENT_TIMEOUT:
+                    print(f"[UDP-SERVER] Клиент {client_ip} неактивен, завершаем сессию")
+                    break
+            continue
+
+        print(f"[UDP-SERVER] {client_ip} -> {line!r}")
+        if not dispatch(line, client_ip, client_id):
             break
-        line = recv_cmd(sock, addr)
 
-    print(f"[UDP-SERVER] {client_id} отключился")
+    with _clients_lock:
+        _clients.pop(client_ip, None)
+    print(f"[UDP-SERVER] {client_ip} отключился")
 
 
-# ─── Главный цикл ─────────────────────────────────────────────────────────────
+# ─── main ─────────────────────────────────────────────────────────────────────
+
 def main():
+    global _sock
     ensure_directories()
-    sock = create_server_socket()
+    _sock = create_server_socket()
+    stop_evt = threading.Event()
 
-    current_client = None
+    disp = threading.Thread(target=dispatcher, args=(stop_evt,), daemon=True)
+    disp.start()
 
     try:
         while True:
-            sock.settimeout(None)
-            raw, addr = sock.recvfrom(HEADER_SIZE + 512)
-            ptype, _flags, _win, seq, length, payload = unpack_header(raw)
-
-            if ptype != PACKET_TYPE_CMD:
-                continue
-
-            ack = pack_header(PACKET_TYPE_CMDACK, seq, 0)
-            sock.sendto(ack, addr)
-
-            if current_client and current_client != addr:
-                send_cmd(sock, addr, "ERROR: сервер занят")
-                continue
-
-            current_client = addr
-            line = payload[:length].decode(errors="replace")
-            handle_client(sock, addr, line)
-            current_client = None
-
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[UDP-SERVER] Остановлен")
+        print("\n[UDP-SERVER] Остановлен по Ctrl+C")
     finally:
-        sock.close()
+        stop_evt.set()
+        _sock.close()
+        time.sleep(1)
 
 
 if __name__ == "__main__":

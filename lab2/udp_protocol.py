@@ -1,275 +1,274 @@
 """
 Лабораторная работа №2 — UDP протокол с надёжной доставкой
+Механизмы: ACK, повторная передача, скользящее окно (Go-Back-N)
+Исправленная версия с корректной обработкой ACK
 """
 
 import socket
 import struct
-import time
 import threading
-from queue import Queue, Empty
-import sys
+import time
 
-# ─── Константы протокола ──────────────────────────────────────────────────────
 PACKET_TYPE_DATA   = 0x01
 PACKET_TYPE_ACK    = 0x02
 PACKET_TYPE_CMD    = 0x03
 PACKET_TYPE_CMDACK = 0x04
 PACKET_TYPE_FIN    = 0x05
 
-# ВАЖНО: правильный формат - 12 байт
-HEADER_FORMAT   = "!BBHII"   # type(1) flags(1) window(2) seq(4) length(4)
-HEADER_SIZE     = struct.calcsize(HEADER_FORMAT)
+HEADER_FORMAT = "!BBHII"
+HEADER_SIZE   = struct.calcsize(HEADER_FORMAT)  # 12 байт
 
-# Максимальный размер данных в одном пакете
-# 1472 - максимальный UDP payload без фрагментации (1500 MTU - 20 IP - 8 UDP)
-# Но для локальной сети можно больше
-MAX_PAYLOAD_SIZE = 8192  # Оптимальный размер для jumbo frames
-BUFFER_SIZE = MAX_PAYLOAD_SIZE
+MAX_PAYLOAD_SIZE = 8192
+BUFFER_SIZE      = MAX_PAYLOAD_SIZE
 
-WINDOW_SIZE     = 64          # размер скользящего окна
-TIMEOUT         = 0.2         # таймаут ожидания ACK
-MAX_RETRIES     = 5          # максимум повторных попыток
-DEFAULT_PORT    = 9091
+WINDOW_SIZE  = 64
+TIMEOUT      = 0.5
+MAX_RETRIES  = 20
+DEFAULT_PORT = 9091
 
 
-# ─── Упаковка / распаковка заголовка ─────────────────────────────────────────
 def pack_header(ptype, seq, length, flags=0, window=WINDOW_SIZE):
-    """Упаковка заголовка в 12 байт"""
     return struct.pack(HEADER_FORMAT, ptype, flags, window, seq, length)
 
 
 def unpack_header(data):
-    """Распаковка заголовка из 12 байт"""
     if len(data) < HEADER_SIZE:
         raise ValueError(f"Пакет слишком короткий: {len(data)} < {HEADER_SIZE}")
     ptype, flags, window, seq, length = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
     return ptype, flags, window, seq, length, data[HEADER_SIZE:]
 
 
-# ─── Отправитель со скользящим окном ─────────────────────────────────────────
+# В начало файла добавить:
+MAX_PAYLOAD_SIZE = 8192  # 8 КБ
+
+
 class SlidingWindowSender:
     def __init__(self, sock, addr, window_size=WINDOW_SIZE, timeout=TIMEOUT):
         self._sock = sock
         self._addr = addr
         self._window = window_size
         self._timeout = timeout
-        self._lock = threading.Lock()
-        self._acks = {}  # seq -> Event
-        self._stop_event = threading.Event()
-        self._recv_thread = None
-        self._start_recv_thread()
+        self._interrupted = False
+        self._acked_count = 0
+        self._total_acked = 0
 
-    def _start_recv_thread(self):
-        """Запуск потока для приема ACK"""
-        self._recv_thread = threading.Thread(target=self._recv_acks, daemon=True)
-        self._recv_thread.start()
+    def interrupt(self):
+        """Прервать передачу"""
+        self._interrupted = True
 
-    def _recv_acks(self):
-        """Фоновый поток: читает ACK-пакеты"""
-        self._sock.settimeout(0.1)
-        while not self._stop_event.is_set():
-            try:
-                data, addr = self._sock.recvfrom(HEADER_SIZE + 4)
-                if addr != self._addr:
-                    continue
-
-                ptype, _flags, _win, seq, _length, _payload = unpack_header(data)
-
-                if ptype == PACKET_TYPE_ACK:
-                    with self._lock:
-                        ev = self._acks.get(seq)
-                        if ev:
-                            ev.set()
-
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"[DEBUG] Ошибка в _recv_acks: {e}")
-                continue
+    def get_acked_count(self):
+        """Получить количество подтвержденных пакетов"""
+        return self._total_acked
 
     def send(self, data, ptype=PACKET_TYPE_DATA):
-        """
-        Отправка данных с использованием скользящего окна
-        Возвращает (bytes_sent, elapsed_sec)
-        """
-        # Разбиваем данные на чанки
-        chunks = []
-        for i in range(0, len(data), BUFFER_SIZE):
-            chunks.append(data[i:i+BUFFER_SIZE])
-
+        chunks = [data[i:i + MAX_PAYLOAD_SIZE]
+                  for i in range(0, max(len(data), 1), MAX_PAYLOAD_SIZE)]
         n = len(chunks)
         if n == 0:
-            return 0, 0
+            return 0, 0.0
 
-        print(f"[DEBUG] Отправка {len(data)} байт = {n} пакетов, размер окна {self._window}")
+        print(f"[PROTO] Отправка {len(data)} байт = {n} пакетов, окно={self._window}")
+
+        original_timeout = self._sock.gettimeout()
+        self._sock.settimeout(self._timeout)
+
+        local_port = self._sock.getsockname()[1]
+        print(f"[PROTO] DATA сокет на порту: {local_port}")
 
         start = time.monotonic()
         base = 0
         next_seq = 0
+        retries = 0
+        acked = set()
+        self._total_acked = 0
 
-        while base < n:
-            # Заполняем окно
-            while next_seq < n and next_seq - base < self._window:
-                ev = threading.Event()
-                with self._lock:
-                    self._acks[next_seq] = ev
+        def send_pkt(seq):
+            chunk = chunks[seq]
+            pkt = pack_header(ptype, seq, len(chunk), window=local_port) + chunk
+            try:
+                self._sock.sendto(pkt, self._addr)
+                if seq % 100 == 0:
+                    print(f"[PROTO] Отправлен пакет seq={seq}")
+            except OSError as e:
+                print(f"[PROTO] Ошибка отправки: {e}")
 
-                # Отправляем пакет - УБЕДИМСЯ что размер не превышает лимит
-                chunk = chunks[next_seq]
-                if len(chunk) > BUFFER_SIZE:
-                    print(f"[ERROR] Пакет {next_seq} слишком большой: {len(chunk)} > {BUFFER_SIZE}")
-                    chunk = chunk[:BUFFER_SIZE]
+        # Отправляем первые пакеты
+        while next_seq < n and next_seq - base < self._window and not self._interrupted:
+            send_pkt(next_seq)
+            next_seq += 1
 
-                header = pack_header(ptype, next_seq, len(chunk), window=self._window)
-                packet = header + chunk
+        while base < n and not self._interrupted:
+            try:
+                raw, addr = self._sock.recvfrom(HEADER_SIZE + 4)
 
-                # Проверка размера перед отправкой
-                if len(packet) > 65507:  # Максимальный размер UDP пакета
-                    print(f"[ERROR] Пакет {next_seq} превышает лимит UDP: {len(packet)}")
-                    # Разбиваем на еще меньшие части
-                    self._split_and_send(chunk, next_seq, ptype)
+                if addr[0] != self._addr[0]:
+                    continue
+
+                ptype_ack, _f, _w, seq, _l, _p = unpack_header(raw)
+
+                if ptype_ack == PACKET_TYPE_ACK:
+                    acked.add(seq)
+                    # Обновляем общее количество подтвержденных пакетов
+                    self._total_acked = max(self._total_acked, len(acked))
+
+                    if seq % 100 == 0:
+                        print(f"[PROTO] Получен ACK для seq={seq}")
+
+                    # Сдвигаем base если подтвержден самый старый неподтвержденный
+                    if seq == base or base in acked:
+                        while base in acked:
+                            acked.discard(base)
+                            base += 1
+                            retries = 0
+                            if base % 100 == 0:
+                                print(f"[PROTO] Прогресс: {base}/{n} пакетов")
+
+            except socket.timeout:
+                if base >= n:
+                    break
+
+                # Проверяем, не подтвердился ли base
+                if base in acked:
+                    while base in acked:
+                        acked.discard(base)
+                        base += 1
+                        retries = 0
                 else:
-                    self._sock.sendto(packet, self._addr)
+                    retries += 1
+                    if retries > MAX_RETRIES:
+                        self._sock.settimeout(original_timeout)
+                        raise ConnectionError(f"Превышено {MAX_RETRIES} повторов на seq={base}")
 
+                    print(f"[PROTO] Таймаут, повтор {retries}/{MAX_RETRIES} для seq={base}")
+
+                    # Пересылаем все неподтвержденные пакеты в окне
+                    for seq in range(base, min(base + self._window, next_seq)):
+                        if seq not in acked:
+                            send_pkt(seq)
+
+            except Exception as e:
+                print(f"[PROTO] Ошибка приема ACK: {e}")
+                continue
+
+            # Заполняем окно новыми пакетами
+            while next_seq < n and next_seq - base < self._window and not self._interrupted:
+                if next_seq not in acked:
+                    send_pkt(next_seq)
                 next_seq += 1
 
-            # Ждем ACK на base
-            with self._lock:
-                ev = self._acks.get(base)
+        self._sock.settimeout(original_timeout)
 
-            if ev and ev.wait(timeout=self._timeout * 3):
-                with self._lock:
-                    self._acks.pop(base, None)
-                base += 1
-                if base % 10 == 0:
-                    print(f"[DEBUG] Прогресс: {base}/{n} пакетов")
-            else:
-                # Таймаут - повторная отправка
-                print(f"[DEBUG] Таймаут на пакете {base}, повторная отправка")
-                with self._lock:
-                    for seq in range(base, next_seq):
-                        self._acks[seq] = threading.Event()
+        elapsed = time.monotonic() - start or 0.001
 
-                for seq in range(base, next_seq):
-                    header = pack_header(ptype, seq, len(chunks[seq]), window=self._window)
-                    self._sock.sendto(header + chunks[seq], self._addr)
+        if self._interrupted:
+            acked_bytes = self._total_acked * MAX_PAYLOAD_SIZE
+            print(f"[PROTO] Передача прервана, подтверждено {self._total_acked} пакетов ({acked_bytes} байт)")
+            return acked_bytes, elapsed
 
-        elapsed = time.monotonic() - start
-        bitrate = (len(data) / 1024) / elapsed
-        print(f"[DEBUG] Отправка завершена за {elapsed:.2f} сек, скорость {bitrate:.1f} КБ/с")
-
-        # Останавливаем поток приема
-        self._stop_event.set()
-        if self._recv_thread and self._recv_thread.is_alive():
-            self._recv_thread.join(timeout=1)
-
+        print(f"[PROTO] Готово: {len(data)} байт за {elapsed:.2f}с, "
+              f"{len(data) / 1024 / elapsed:.1f} КБ/с")
         return len(data), elapsed
 
-    def _split_and_send(self, data, original_seq, ptype):
-        """Разбивает большой кусок на меньшие и отправляет"""
-        print(f"[DEBUG] Разбиваем пакет {original_seq} размером {len(data)} на меньшие")
-        sub_chunks = [data[i:i+1400] for i in range(0, len(data), 1400)]
 
-        for i, sub_chunk in enumerate(sub_chunks):
-            sub_seq = original_seq * 1000 + i  # Условный номер
-            header = pack_header(ptype, sub_seq, len(sub_chunk), window=self._window)
-            packet = header + sub_chunk
-            self._sock.sendto(packet, self._addr)
-            time.sleep(0.001)  # Небольшая задержка
-
-
-# ─── Приёмник со скользящим окном ────────────────────────────────────────────
 class SlidingWindowReceiver:
-    def __init__(self, sock, addr, total_bytes, ptype=PACKET_TYPE_DATA):
+    def __init__(self, sock, addr, total_bytes, ptype=PACKET_TYPE_DATA, timeout=30):
         self._sock = sock
-        self._addr = addr
+        self._addr = addr  # (ip, port) клиента
         self._total = total_bytes
         self._ptype = ptype
         self._buf = {}
+        self._last_report = time.monotonic()
         self._received = 0
-        # Увеличиваем буфер сокета
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)  # 1 МБ
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)  # 1 МБ
-        self._sock.settimeout(TIMEOUT * MAX_RETRIES)
-
-    def _send_ack(self, seq):
-        """Отправка подтверждения"""
-        header = pack_header(PACKET_TYPE_ACK, seq, 0)
-        try:
-            self._sock.sendto(header, self._addr)
-        except Exception as e:
-            print(f"[DEBUG] Ошибка отправки ACK: {e}")
+        self._timeout = timeout
+        self._last_packet_time = time.monotonic()
 
     def receive(self):
-        """Прием данных с подтверждением"""
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
+        except OSError:
+            pass
+
+        original_timeout = self._sock.gettimeout()
+        self._sock.settimeout(1.0)  # Таймаут 1 секунда для возможности прерывания
+
         data = bytearray()
         expected = 0
-        received_bytes = 0
-        last_report = time.monotonic()
+        received = 0
+        idle = 0
+        max_idle = self._timeout  # Максимальное время простоя в секундах
 
-        print(f"[DEBUG] Прием {self._total} байт")
+        print(f"[PROTO] Ожидаю {self._total} байт от {self._addr[0]}")
 
-        while received_bytes < self._total:
+        while received < self._total:
             try:
-                raw, addr = self._sock.recvfrom(HEADER_SIZE + BUFFER_SIZE + 1024)  # +1024 запас
+                raw, addr = self._sock.recvfrom(65536)
+                self._last_packet_time = time.monotonic()
+                idle = 0
+            except socket.timeout:
+                idle += 1
+                # Проверяем общий таймаут
+                if time.monotonic() - self._last_packet_time > max_idle:
+                    self._sock.settimeout(original_timeout)
+                    raise TimeoutError(f"Таймаут приема: {received}/{self._total}")
+                if idle % 10 == 0:
+                    print(f"[PROTO] Ожидание пакета seq={expected} (таймаут {idle})")
+                continue
+            except OSError as e:
+                self._sock.settimeout(original_timeout)
+                raise ConnectionError(str(e))
 
-                if addr != self._addr:
-                    continue
+            # Проверяем IP отправителя
+            if addr[0] != self._addr[0]:
+                continue
 
-                # Проверяем минимальную длину
-                if len(raw) < HEADER_SIZE:
-                    print(f"[DEBUG] Слишком короткий пакет: {len(raw)} байт")
-                    continue
+            try:
+                ptype, _f, ack_port, seq, length, payload = unpack_header(raw)
+            except ValueError:
+                continue
 
-                try:
-                    ptype, _flags, _win, seq, length, payload = unpack_header(raw)
-                except Exception as e:
-                    print(f"[DEBUG] Ошибка распаковки: {e}")
-                    continue
+            if ptype != self._ptype:
+                continue
+            if len(payload) < length:
+                continue
 
-                # Проверяем длину payload
-                if len(payload) < length:
-                    print(f"[DEBUG] Неполный payload: ожидалось {length}, получено {len(payload)}")
-                    continue
+            # Отправляем ACK на порт, указанный в пакете
+            try:
+                ack_pkt = pack_header(PACKET_TYPE_ACK, seq, 0)
+                self._sock.sendto(ack_pkt, (addr[0], ack_port))
 
-                if ptype != self._ptype:
-                    print(f"[DEBUG] Неверный тип пакета: {ptype}")
-                    continue
+                if seq % 100 == 0 or seq == expected:
+                    print(f"[PROTO] Отправлен ACK для seq={seq} на порт {ack_port}")
 
-                # Отправляем ACK
-                self._send_ack(seq)
+            except OSError as e:
+                print(f"[PROTO] Ошибка отправки ACK: {e}")
 
-                # Обработка пакета
-                if seq == expected:
-                    data.extend(payload[:length])
-                    received_bytes += length
+            # Обработка полученного пакета
+            if seq == expected:
+                data.extend(payload[:length])
+                received += len(payload[:length])
+                expected += 1
+
+                # Добавляем буферизованные пакеты
+                while expected in self._buf:
+                    chunk = self._buf.pop(expected)
+                    data.extend(chunk)
+                    received += len(chunk)
                     expected += 1
 
-                    # Добавляем буферизованные пакеты
-                    while expected in self._buf:
-                        chunk = self._buf.pop(expected)
-                        data.extend(chunk)
-                        received_bytes += len(chunk)
-                        expected += 1
-
-                    # Отчет о прогрессе каждые 5 секунд
-                    now = time.monotonic()
-                    if now - last_report > 5:
-                        progress = (received_bytes / self._total) * 100
-                        print(f"[DEBUG] Прогресс: {progress:.1f}% ({received_bytes}/{self._total} байт)")
-                        last_report = now
-
-                elif seq > expected:
+            elif seq > expected:
+                # Буферизуем пакеты, пришедшие не по порядку
+                if seq not in self._buf:
                     self._buf[seq] = payload[:length]
-                    if len(self._buf) % 10 == 0:
-                        print(f"[DEBUG] Буфер: {len(self._buf)} пакетов")
+                    if len(self._buf) % 50 == 0:
+                        print(f"[PROTO] Буфер: {len(self._buf)} пакетов, ожидаем {expected}")
 
-            except socket.timeout:
-                print(f"[DEBUG] Таймаут приема, ожидаем пакет {expected}")
-                continue
-            except Exception as e:
-                print(f"[DEBUG] Ошибка в receive: {e}")
-                raise ConnectionError(f"Ошибка приема данных: {e}")
+            # Отчет о прогрессе
+            now = time.monotonic()
+            if now - self._last_report > 2:
+                progress = (received / self._total) * 100
+                print(f"[PROTO] {progress:.1f}% ({received}/{self._total})")
+                self._last_report = now
 
-        print(f"[DEBUG] Прием завершен, получено {received_bytes} байт")
+        self._sock.settimeout(original_timeout)
+        print(f"[PROTO] Принято {received} байт")
         return bytes(data)
