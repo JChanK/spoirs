@@ -23,7 +23,7 @@ HOST        = "0.0.0.0"
 PORT        = DEFAULT_PORT
 FILES_DIR   = "server_files_udp"
 SESSIONS_DIR = "sessions_udp"
-CMD_TIMEOUT = 10.0   # сек ожидания командного пакета
+CMD_TIMEOUT = 100.0   # сек ожидания командного пакета
 
 
 # ─── Инициализация ────────────────────────────────────────────────────────────
@@ -35,6 +35,10 @@ def ensure_directories():
 def create_server_socket():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16*1024*1024)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16*1024*1024)
+
     s.bind((HOST, PORT))
     print(f"[UDP-SERVER] Слушаю на {HOST}:{PORT}")
     return s

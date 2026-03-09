@@ -29,6 +29,17 @@ def ensure_directories():
 
 def create_socket():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # КРИТИЧЕСКИ ВАЖНО: увеличиваем буферы ДО 64 МБ
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024 * 1024)
+    except:
+        print("[CLIENT] Не удалось установить большой буфер, использую стандартный")
+
+    # Делаем сокет неблокирующим с таймаутом
+    s.settimeout(5.0)
+
     return s
 
 
@@ -80,11 +91,31 @@ def do_upload(sock, addr, filepath):
     filename   = os.path.basename(filepath)
     total_size = os.path.getsize(filepath)
 
-    send_cmd(sock, addr, f"UPLOAD {filename}")
-    send_cmd(sock, addr, f"SIZE {total_size}")
+    # Шаг 1: Отправляем команду UPLOAD
+    if not send_cmd(sock, addr, f"UPLOAD {filename}"):
+        print("[CLIENT] Не удалось отправить команду UPLOAD")
+        return
 
+    # Шаг 2: Ждем подтверждение от сервера
     response = recv_cmd(sock, addr)
-    if response is None or not response.startswith("OFFSET"):
+    if response is None:
+        print("[CLIENT] Нет ответа от сервера")
+        return
+
+    print(f"[CLIENT] Ответ сервера: {response}")
+
+    # Шаг 3: Отправляем размер файла
+    if not send_cmd(sock, addr, f"SIZE {total_size}"):
+        print("[CLIENT] Не удалось отправить размер файла")
+        return
+
+    # Шаг 4: Ждем ответ с OFFSET
+    response = recv_cmd(sock, addr)
+    if response is None:
+        print("[CLIENT] Нет ответа от сервера (OFFSET)")
+        return
+
+    if not response.startswith("OFFSET"):
         print(f"[CLIENT] Неожиданный ответ: {response}")
         return
 
@@ -153,9 +184,13 @@ def interactive_loop(sock, addr):
 
     while True:
         try:
-            user_input = input("> ").strip()
+            # Пробуем прочитать с обработкой ошибок кодировки
+            user_input = input("> ").encode('utf-8', errors='ignore').decode('utf-8').strip()
         except EOFError:
             break
+        except UnicodeDecodeError:
+            print("[CLIENT] Ошибка кодировки ввода. Используйте латиницу.")
+            continue
 
         if not user_input:
             continue
