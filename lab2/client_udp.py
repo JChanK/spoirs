@@ -1,11 +1,3 @@
-"""
-Лабораторная работа №2 — UDP Клиент
-Команды: ECHO, TIME, CLOSE, UPLOAD, DOWNLOAD
-
-DATA-трафик идёт на отдельный порт сервера (DATAPORT из ответа),
-поэтому не конкурирует с CMD-обменом.
-"""
-
 import socket, os, time, sys, hashlib, json
 from collections import deque
 import threading
@@ -22,7 +14,6 @@ DOWNLOAD_DIR = "downloads_udp"
 SESSION_DIR = "client_sessions_udp"
 CMD_BUFSIZE  = HEADER_SIZE + 4096
 
-# Флаг для отслеживания прерывания
 _interrupted = False
 _inbox: deque = deque()
 
@@ -40,9 +31,6 @@ def create_socket():
     except OSError:
         pass
     return s
-
-
-# ─── Сессии для докачки ───────────────────────────────────────────────────────
 
 def session_path(server_addr, filename, direction):
     key = f"{server_addr[0]}:{server_addr[1]}:{filename}:{direction}"
@@ -65,7 +53,6 @@ def save_session(server_addr, filename, direction, offset, total_size=None):
         json.dump(data, f)
     print(f"[CLIENT] Сессия сохранена: {filename} offset={offset}")
 
-
 def load_session(server_addr, filename, direction):
     path = session_path(server_addr, filename, direction)
     if os.path.exists(path):
@@ -77,15 +64,11 @@ def load_session(server_addr, filename, direction):
             return 0
     return 0
 
-
 def delete_session(server_addr, filename, direction):
     path = session_path(server_addr, filename, direction)
     if os.path.exists(path):
         os.remove(path)
         print(f"[CLIENT] Сессия удалена: {filename}")
-
-
-# ─── CMD обмен ───────────────────────────────────────────────────────────────
 
 def send_cmd(sock, addr, text):
     payload = text.encode()
@@ -113,7 +96,6 @@ def send_cmd(sock, addr, text):
                 _inbox.append(pl[:length].decode(errors="replace"))
     return False
 
-
 def recv_cmd(sock, addr, timeout=10.0):
     if _inbox:
         return _inbox.popleft()
@@ -140,15 +122,11 @@ def parse_dataport(response, keyword):
             return int(parts[i + 1])
     return None
 
-
 def make_data_socket():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16 * 1024 * 1024)
     return s
-
-
-# ─── UPLOAD ──────────────────────────────────────────────────────────────────
 
 def do_upload(sock, addr, filepath):
     global _interrupted
@@ -204,7 +182,6 @@ def do_upload(sock, addr, filepath):
     srv_data_addr = (addr[0], data_port)
     sender = SlidingWindowSender(data_sock, srv_data_addr)
 
-    # Сохраняем сессию перед началом
     save_session(addr, filename, "upload", offset, total_size)
 
     try:
@@ -232,9 +209,6 @@ def do_upload(sock, addr, filepath):
     print(f"[CLIENT] Скорость: {(total_size-offset)/elapsed/1024:.1f} КБ/с")
 
     delete_session(addr, filename, "upload")
-
-
-# ─── DOWNLOAD ────────────────────────────────────────────────────────────────
 
 def do_download(sock, addr, filename):
     global _interrupted
@@ -310,9 +284,6 @@ def do_download(sock, addr, filename):
 
     delete_session(addr, filename, "download")
 
-
-# ─── Интерактивный цикл ──────────────────────────────────────────────────────
-
 def flush_inbox(sock, addr):
     _inbox.clear()
     sock.settimeout(0.1)
@@ -328,7 +299,6 @@ def flush_inbox(sock, addr):
                     pass
         except socket.timeout:
             break
-
 
 def interactive_loop(sock, addr):
     global _inbox, _interrupted
@@ -393,7 +363,6 @@ def interactive_loop(sock, addr):
                 print(f"[SERVER] {r}")
             else:
                 print("[CLIENT] Нет ответа от сервера")
-
 
 def main():
     ensure_directories()
