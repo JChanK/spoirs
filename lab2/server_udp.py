@@ -1,4 +1,3 @@
-# В начале файла добавим:
 import threading
 import time
 import socket
@@ -18,13 +17,11 @@ PORT         = DEFAULT_PORT
 FILES_DIR    = "server_files_udp"
 SESSIONS_DIR = "sessions_udp"
 CMD_BUFSIZE  = HEADER_SIZE + 4096
-CLIENT_TIMEOUT = 30  # Таймаут неактивности клиента в секундах
+CLIENT_TIMEOUT = 30 
 
 _sock: socket.socket = None   # главный CMD-сокет
 _send_lock = threading.Lock()
 
-# ИЗМЕНЕНИЕ: Ключ - только IP-адрес, а не полный адрес
-# client_ip -> {"cmd_ports": set(), "sessions": dict, "last_activity": float}
 _clients      = {}
 _clients_lock = threading.Lock()
 
@@ -57,11 +54,7 @@ def _send_cmd_pkt(addr, pkt):
     with _send_lock:
         _sock.sendto(pkt, addr)
 
-
-# ─── Диспетчер ───────────────────────────────────────────────────────────────
-
 def dispatcher(stop_evt):
-    """Единственный поток читающий главный сокет."""
     last_cleanup = time.monotonic()
 
     while not stop_evt.is_set():
@@ -69,7 +62,6 @@ def dispatcher(stop_evt):
         try:
             raw, addr = _sock.recvfrom(CMD_BUFSIZE)
 
-            # Обновляем время активности для этого клиента (по IP)
             client_ip = addr[0]
             with _clients_lock:
                 if client_ip in _clients:
@@ -92,7 +84,6 @@ def dispatcher(stop_evt):
             continue
 
         if ptype == PACKET_TYPE_CMD:
-            # Подтвердить получение
             _send_cmd_pkt(addr, pack_header(PACKET_TYPE_CMDACK, seq, 0))
             line = payload[:length].decode(errors="replace")
 
@@ -101,11 +92,8 @@ def dispatcher(stop_evt):
                 entry = _clients.get(client_ip)
 
             if entry is not None:
-                # Добавляем команду во все потоки клиента
-                # Вместо одного потока на порт, у нас один поток на IP
                 pass
             else:
-                # Новый клиент по IP
                 new_entry = {
                     "cmd_ports": {addr[1]},
                     "sessions": {},
@@ -116,7 +104,6 @@ def dispatcher(stop_evt):
                 with _clients_lock:
                     _clients[client_ip] = new_entry
 
-                # Запускаем один поток для всего IP
                 thread = threading.Thread(
                     target=client_session,
                     args=(client_ip,),
@@ -125,7 +112,6 @@ def dispatcher(stop_evt):
                 thread.start()
                 new_entry["thread"] = thread
 
-            # Добавляем команду в очередь для этого IP
             with _clients_lock:
                 if client_ip in _clients:
                     _clients[client_ip]["cmd_queue"].append(line)
@@ -135,12 +121,10 @@ def dispatcher(stop_evt):
             with _clients_lock:
                 entry = _clients.get(client_ip)
             if entry:
-                # Можно использовать для синхронизации, но сейчас не критично
                 pass
 
 
 def cleanup_inactive_clients(now):
-    """Удалить неактивных клиентов"""
     with _clients_lock:
         inactive = [ip for ip, data in _clients.items()
                    if now - data.get("last_activity", 0) > CLIENT_TIMEOUT]
@@ -149,10 +133,7 @@ def cleanup_inactive_clients(now):
             _clients.pop(ip, None)
 
 
-# ─── CMD обмен ───────────────────────────────────────────────────────────────
-
 def send_cmd_to_ip(client_ip, text, retries=10):
-    """Отправить команду всем портам клиента"""
     with _clients_lock:
         entry = _clients.get(client_ip)
     if not entry:
@@ -165,7 +146,6 @@ def send_cmd_to_ip(client_ip, text, retries=10):
     pl = text.encode()
     pkt = pack_header(PACKET_TYPE_CMD, 0, len(pl)) + pl
 
-    # Отправляем на все порты клиента (на всякий случай)
     for port in ports:
         addr = (client_ip, port)
         for _ in range(retries):
@@ -177,7 +157,6 @@ def send_cmd_to_ip(client_ip, text, retries=10):
 
 
 def recv_cmd_for_ip(client_ip, timeout=120.0):
-    """Получить команду из очереди для IP"""
     with _clients_lock:
         entry = _clients.get(client_ip)
     if not entry:
@@ -190,9 +169,6 @@ def recv_cmd_for_ip(client_ip, timeout=120.0):
             return q.popleft()
         time.sleep(0.005)
     return None
-
-
-# ─── Сессии (докачка) ────────────────────────────────────────────────────────
 
 def _sf(cid, key):
     h = hashlib.md5(f"{cid}:{key}".encode()).hexdigest()
@@ -209,8 +185,6 @@ def delete_session(cid, key):
     p = _sf(cid, key)
     if os.path.exists(p): os.remove(p)
 
-
-# ─── Обработчики команд ──────────────────────────────────────────────────────
 
 def handle_echo(client_ip, args):
     send_cmd_to_ip(client_ip, args if args else "(пусто)")
@@ -302,8 +276,6 @@ def handle_download(client_ip, filename, client_id):
     with open(filepath, "rb") as f:
         f.seek(offset); data = f.read()
 
-    # Для отправки данных нужен полный адрес клиента
-    # Берем первый порт из множества
     with _clients_lock:
         ports = _clients.get(client_ip, {}).get("cmd_ports", set())
     if ports:
@@ -326,9 +298,6 @@ def handle_download(client_ip, filename, client_id):
     delete_session(client_id, "download:" + filename)
     print(f"[UDP-SERVER] DOWNLOAD {filename} завершён, {bitrate:.1f} КБ/с")
 
-
-# ─── Диспетчер команд ────────────────────────────────────────────────────────
-
 def dispatch(line, client_ip, client_id):
     parts = line.strip().split(None, 1)
     if not parts: return True
@@ -350,10 +319,7 @@ def dispatch(line, client_ip, client_id):
     else:
         send_cmd_to_ip(client_ip, f"ERROR: неизвестная команда '{cmd}'")
     return True
-
-
-# ─── Сессия клиента ──────────────────────────────────────────────────────────
-
+    
 def client_session(client_ip):
     client_id = client_ip  # Используем IP как ID
     print(f"[UDP-SERVER] Новый клиент {client_ip}")
@@ -380,8 +346,6 @@ def client_session(client_ip):
         _clients.pop(client_ip, None)
     print(f"[UDP-SERVER] {client_ip} отключился")
 
-
-# ─── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     global _sock
