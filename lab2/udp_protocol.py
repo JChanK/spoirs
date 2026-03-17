@@ -38,7 +38,7 @@ class SlidingWindowSender:
                 _, _, _, ack_seq, _ = struct.unpack(HEADER_FMT, raw[:HEADER_SIZE])
                 if ack_seq >= base:
                     base = ack_seq + 1
-                    if base % 100 == 0: print(f"[SENDER] Прогресс: {base}/{n}")
+                    if base % 10000 == 0: print(f"[SENDER] Прогресс: {base}/{n}")
             except:
                 time.sleep(0.001)
 
